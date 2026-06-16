@@ -1,0 +1,6 @@
+pandas
+pyarrow
+pydantic
+tqdm
+nicegui
+plotly
