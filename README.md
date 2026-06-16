@@ -67,4 +67,3 @@ Built from the ground up for extreme speed, rich responsiveness, and minimal mem
 - [`main.py`](main.py): The main presentation layer managing application states, global keybinds, layout rendering, and server configuration.
 - [`eda_backend.py`](eda_backend.py): The data operations layer managing binary `.idx` offsets, columnar Parquet structures, lazy seeking, and streaming exports.
 - [`requirements.txt`](requirements.txt): Declares Python dependencies for the NiceGUI and data analysis stack.
-- [`example_line.jsonl`](example_line.jsonl): A small sample dataset file for testing and verification.
