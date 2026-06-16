@@ -11,6 +11,20 @@ from nicegui.events import KeyEventArguments
 from nicegui.element import Element
 import eda_backend
 
+from fastapi.responses import FileResponse
+import urllib.parse
+
+@app.get('/local_image')
+def get_local_image(path: str):
+    decoded_path = urllib.parse.unquote(path)
+    if not os.path.exists(decoded_path):
+        return {"error": "File not found"}, 404
+    # Security check: Ensure we only serve images
+    _, ext = os.path.splitext(decoded_path.lower())
+    if ext not in ['.jpg', '.jpeg', '.png', '.gif', '.webp', '.bmp']:
+        return {"error": "Invalid image extension"}, 403
+    return FileResponse(decoded_path)
+
 # Monkeypatch NiceGUI Element.parent_slot to return None instead of raising RuntimeError
 # when the parent slot has been deleted. This gracefully handles asynchronous event/value updates
 # during rapid re-renders or page clears without triggering startup tracebacks.
@@ -61,14 +75,24 @@ def parse_args():
         default=8080,
         help="Server port"
     )
+    parser.add_argument(
+        "--config", "-c",
+        type=str,
+        default="schema_config.json",
+        help="Path to schema config JSON file"
+    )
     args, _ = parser.parse_known_args()
     return args
 
 args = parse_args()
 
 class AppState:
-    def __init__(self, initial_dir=None):
+    def __init__(self, initial_dir=None, config_path="schema_config.json"):
         self.current_dir = initial_dir or r"F:\datasets\deepghs\deepghs--danbooru2024-captions-gemini-flash-1.5"
+        self.config_path = config_path
+        self.config = {}
+        self.mappings = {}
+        self.load_config()
 
         # Fallback to workspace root if directory doesn't exist
         if not os.path.exists(self.current_dir) or not os.path.isdir(self.current_dir):
@@ -90,7 +114,7 @@ class AppState:
         self.active_index = 0  # 0-indexed offset within the active page grid
 
         # Sorting
-        self.sort_col = "score"
+        self.sort_col = "score" if "score" in self.mappings else (list(self.mappings.keys())[0] if self.mappings else "byte_offset")
         self.sort_order = "Descending"  # Descending or Ascending
 
         # Standard Filters
@@ -129,6 +153,71 @@ class AppState:
             return ""
         return os.path.join(self.current_dir, self.current_file)
 
+    def load_config(self):
+        default_mappings = {
+            "id": "id",
+            "score": "score",
+            "rating": "rating",
+            "file_ext": "file_ext",
+            "image_width": "image_width",
+            "image_height": "image_height",
+            "fav_count": "fav_count",
+            "created_at": "created_at",
+            "tags": ["tags", "tag_string"],
+            "regular_summary": "regular_summary",
+            "individual_parts": "individual_parts"
+        }
+        default_image_source = {
+            "type": "url",
+            "keys": ["large_file_url", "file_url", "preview_file_url"],
+            "prefix": ""
+        }
+        if os.path.exists(self.config_path):
+            try:
+                with open(self.config_path, "r", encoding="utf-8") as f:
+                    self.config = json.load(f)
+            except Exception as e:
+                print(f"Error loading config {self.config_path}: {e}")
+                self.config = {}
+        else:
+            self.config = {}
+
+        self.mappings = self.config.get("mappings", default_mappings)
+        if "image_source" not in self.config:
+            self.config["image_source"] = default_image_source
+
+    def format_image_src(self, record):
+        import urllib.parse
+        img_config = self.config.get("image_source", {})
+        source_type = img_config.get("type", "url").lower()
+        keys = img_config.get("keys", [])
+        prefix = img_config.get("prefix", "")
+
+        val = eda_backend.resolve_config_key(record, keys)
+        if not val:
+            return None
+
+        val_str = str(val).strip()
+
+        if source_type == "url":
+            return f"{prefix}{val_str}"
+
+        elif source_type == "path":
+            # Check if absolute path or relative
+            full_path = os.path.abspath(val_str)
+            escaped_path = urllib.parse.quote(full_path)
+            return f"/local_image?path={escaped_path}"
+
+        elif source_type == "base64":
+            # Automatically insert standard mime header if not present
+            if not val_str.startswith("data:image"):
+                # Use prefix from config or default jpeg mime
+                pfx = prefix or "data:image/jpeg;base64,"
+                return f"{pfx}{val_str}"
+            return val_str
+
+        return None
+
     def list_jsonl_files(self):
         if not os.path.exists(self.current_dir) or not os.path.isdir(self.current_dir):
             return []
@@ -142,35 +231,40 @@ class AppState:
         df = self.metadata_df
         if df.empty:
             return
-        self.all_ratings = sorted([r for r in df['rating'].unique() if r])
-        self.all_exts = sorted([e for e in df['file_ext'].unique() if e])
 
-        self.min_score = int(df['score'].min())
-        self.max_score = int(df['score'].max())
-        if self.min_score == self.max_score:
-            self.max_score += 1
+        self.all_ratings = sorted([r for r in df['rating'].unique() if r]) if 'rating' in df.columns else []
+        self.all_exts = sorted([e for e in df['file_ext'].unique() if e]) if 'file_ext' in df.columns else []
 
-        self.min_fav = int(df['fav_count'].min())
-        self.max_fav = int(df['fav_count'].max())
-        if self.min_fav == self.max_fav:
-            self.max_fav += 1
+        if 'score' in df.columns:
+            self.min_score = int(df['score'].min())
+            self.max_score = int(df['score'].max())
+            if self.min_score == self.max_score:
+                self.max_score += 1
+            self.score_range = [self.min_score, self.max_score]
 
-        self.min_w = int(df['image_width'].min())
-        self.max_w = int(df['image_width'].max())
-        if self.min_w == self.max_w:
-            self.max_w += 1
+        if 'fav_count' in df.columns:
+            self.min_fav = int(df['fav_count'].min())
+            self.max_fav = int(df['fav_count'].max())
+            if self.min_fav == self.max_fav:
+                self.max_fav += 1
+            self.fav_range = [self.min_fav, self.max_fav]
 
-        self.min_h = int(df['image_height'].min())
-        self.max_h = int(df['image_height'].max())
-        if self.min_h == self.max_h:
-            self.max_h += 1
+        if 'image_width' in df.columns:
+            self.min_w = int(df['image_width'].min())
+            self.max_w = int(df['image_width'].max())
+            if self.min_w == self.max_w:
+                self.max_w += 1
+            self.w_range = [self.min_w, self.max_w]
+
+        if 'image_height' in df.columns:
+            self.min_h = int(df['image_height'].min())
+            self.max_h = int(df['image_height'].max())
+            if self.min_h == self.max_h:
+                self.max_h += 1
+            self.h_range = [self.min_h, self.max_h]
 
         self.rating_selection = list(self.all_ratings)
         self.ext_selection = list(self.all_exts)
-        self.score_range = [self.min_score, self.max_score]
-        self.fav_range = [self.min_fav, self.max_fav]
-        self.w_range = [self.min_w, self.max_w]
-        self.h_range = [self.min_h, self.max_h]
 
     def apply_all_filters(self):
         df = self.metadata_df.copy()
@@ -179,25 +273,32 @@ class AppState:
             return
 
         # Standard filters
-        if self.rating_selection:
-            df = df[df['rating'].isin(self.rating_selection)]
-        else:
-            df = df[df['rating'].isin([])]
+        if 'rating' in df.columns:
+            if self.rating_selection:
+                df = df[df['rating'].isin(self.rating_selection)]
+            else:
+                df = df[df['rating'].isin([])]
 
-        if self.ext_selection:
-            df = df[df['file_ext'].isin(self.ext_selection)]
-        else:
-            df = df[df['file_ext'].isin([])]
+        if 'file_ext' in df.columns:
+            if self.ext_selection:
+                df = df[df['file_ext'].isin(self.ext_selection)]
+            else:
+                df = df[df['file_ext'].isin([])]
 
-        df = df[(df['score'] >= self.score_range[0]) & (df['score'] <= self.score_range[1])]
-        df = df[(df['fav_count'] >= self.fav_range[0]) & (df['fav_count'] <= self.fav_range[1])]
-        df = df[(df['image_width'] >= self.w_range[0]) & (df['image_width'] <= self.w_range[1])]
-        df = df[(df['image_height'] >= self.h_range[0]) & (df['image_height'] <= self.h_range[1])]
+        if 'score' in df.columns:
+            df = df[(df['score'] >= self.score_range[0]) & (df['score'] <= self.score_range[1])]
+        if 'fav_count' in df.columns:
+            df = df[(df['fav_count'] >= self.fav_range[0]) & (df['fav_count'] <= self.fav_range[1])]
+        if 'image_width' in df.columns:
+            df = df[(df['image_width'] >= self.w_range[0]) & (df['image_width'] <= self.w_range[1])]
+        if 'image_height' in df.columns:
+            df = df[(df['image_height'] >= self.h_range[0]) & (df['image_height'] <= self.h_range[1])]
 
-        if self.text_query:
-            df = df[df['regular_summary'].str.contains(self.text_query, case=False, na=False)]
+        summary_col = 'regular_summary' if 'regular_summary' in df.columns else ('summary' if 'summary' in df.columns else None)
+        if summary_col and self.text_query:
+            df = df[df[summary_col].str.contains(self.text_query, case=False, na=False)]
 
-        if self.tag_query:
+        if 'tags' in df.columns and self.tag_query:
             terms = self.tag_query.strip().split()
             for term in terms:
                 if term.startswith('-'):
@@ -278,7 +379,7 @@ class AppState:
         else:
             self.active_index = 0
 
-state = AppState(initial_dir=args.dir)
+state = AppState(initial_dir=args.dir, config_path=args.config)
 
 # Helpers
 def format_bytes(n):
@@ -289,7 +390,7 @@ def format_bytes(n):
     return f"{n:.2f} PB"
 
 def get_ratings_chart(filtered_df):
-    if filtered_df.empty:
+    if filtered_df.empty or 'rating' not in filtered_df.columns:
         return go.Figure()
     rating_counts = filtered_df['rating'].value_counts()
     fig = go.Figure(data=[go.Bar(
@@ -309,7 +410,7 @@ def get_ratings_chart(filtered_df):
     return fig
 
 def get_tags_chart(filtered_df):
-    if filtered_df.empty:
+    if filtered_df.empty or 'tags' not in filtered_df.columns:
         return go.Figure()
     tags_series = filtered_df['tags'].dropna().astype(str)
     all_tags = tags_series.str.cat(sep=' ').split()
@@ -402,7 +503,7 @@ async def refresh_grid():
                 card.on('click', make_click_handler(idx))
 
                 with card:
-                    preview_url = record.get('large_file_url') or record.get('file_url') or record.get('preview_file_url') if record else None
+                    preview_url = state.format_image_src(record) if record else None
                     if preview_url:
                         ui.image(preview_url).classes('h-48 object-contain bg-black rounded-lg w-full')
                     else:
@@ -411,7 +512,9 @@ async def refresh_grid():
                             ui.label('No Image URL').classes('text-xs')
 
                     seq_num = start_idx + idx + 1
-                    rec_id = record.get('id', 'N/A') if record else 'N/A'
+                    rec_id = eda_backend.resolve_config_key(record, state.mappings.get('id', 'id')) if record else 'N/A'
+                    if rec_id is None:
+                        rec_id = 'N/A'
                     ui.label(f"[{seq_num}] ID: {rec_id}").classes('text-sm font-bold text-zinc-200 truncate')
 
                     # Trim checkbox
@@ -439,11 +542,13 @@ async def refresh_inspector():
         offset = row['byte_offset']
         is_trimmed = (offset in state.trimmed_offsets)
 
-        rec_id = record.get('id', 'N/A')
+        rec_id = eda_backend.resolve_config_key(record, state.mappings.get('id', 'id'))
+        if rec_id is None:
+            rec_id = 'N/A'
         ui.label(f"🔑 Record ID: {rec_id}").classes('text-xl font-extrabold text-cyan-400 border-b border-zinc-850 pb-2 w-full')
 
         # High fidelity preview
-        preview_url = record.get('large_file_url') or record.get('file_url') or record.get('preview_file_url')
+        preview_url = state.format_image_src(record)
         if preview_url:
             ui.image(preview_url).classes('w-full max-h-[400px] object-contain bg-black rounded-lg shadow-md border border-zinc-800')
         else:
@@ -462,13 +567,13 @@ async def refresh_inspector():
             ui.label('Properties').classes('text-xs font-bold uppercase tracking-wider text-zinc-500 border-b border-zinc-850 pb-1 mb-1')
 
             props = [
-                ("ID", str(record.get('id', 'N/A'))),
-                ("Created At", str(record.get('created_at', 'N/A'))),
-                ("Rating", str(record.get('rating', 'N/A'))),
-                ("File Ext", str(record.get('file_ext', 'N/A'))),
-                ("Resolution", f"{record.get('image_width', '0')} x {record.get('image_height', '0')}"),
-                ("Score", str(record.get('score', 0))),
-                ("Favorites", str(record.get('fav_count', 0)))
+                ("ID", str(eda_backend.resolve_config_key(record, state.mappings.get('id', 'id')) or 'N/A')),
+                ("Created At", str(eda_backend.resolve_config_key(record, state.mappings.get('created_at', 'created_at')) or 'N/A')),
+                ("Rating", str(eda_backend.resolve_config_key(record, state.mappings.get('rating', 'rating')) or 'N/A')),
+                ("File Ext", str(eda_backend.resolve_config_key(record, state.mappings.get('file_ext', 'file_ext')) or 'N/A')),
+                ("Resolution", f"{eda_backend.resolve_config_key(record, state.mappings.get('image_width', 'image_width')) or '0'} x {eda_backend.resolve_config_key(record, state.mappings.get('image_height', 'image_height')) or '0'}"),
+                ("Score", str(eda_backend.resolve_config_key(record, state.mappings.get('score', 'score')) or 0)),
+                ("Favorites", str(eda_backend.resolve_config_key(record, state.mappings.get('fav_count', 'fav_count')) or 0))
             ]
 
             for label, val in props:
@@ -477,17 +582,18 @@ async def refresh_inspector():
                     ui.label(val).classes('text-zinc-100 font-semibold')
 
         # AI Summary (Gemini Description)
-        summary_text = record.get('regular_summary') or '*No summary available.*'
+        summary_text = eda_backend.resolve_config_key(record, state.mappings.get('regular_summary', 'regular_summary')) or '*No summary available.*'
         with ui.expansion('🤖 AI Summary', value=True).classes('w-full border border-zinc-850 rounded-xl overflow-hidden bg-zinc-900/30 text-sm font-bold'):
             ui.label(summary_text).classes('text-sm text-zinc-300 p-3 leading-relaxed font-normal')
 
         # AI Layout Analysis
-        if 'individual_parts' in record and record['individual_parts']:
+        ind_parts_val = eda_backend.resolve_config_key(record, state.mappings.get('individual_parts', 'individual_parts'))
+        if ind_parts_val:
             with ui.expansion('📊 AI Layout Analysis', value=False).classes('w-full border border-zinc-850 rounded-xl overflow-hidden bg-zinc-900/30 text-sm font-bold'):
-                ui.markdown(record['individual_parts']).classes('text-xs text-zinc-300 p-3 leading-relaxed font-normal')
+                ui.markdown(str(ind_parts_val)).classes('text-xs text-zinc-300 p-3 leading-relaxed font-normal')
 
         # Space-separated tags list formatted into neat badge chips
-        tags_str = record.get('tags') or record.get('tag_string') or ''
+        tags_str = eda_backend.resolve_config_key(record, state.mappings.get('tags', 'tags')) or ''
         tags_list = sorted([t.strip() for t in tags_str.split() if t.strip()])
         with ui.column().classes('w-full gap-2 mt-2'):
             ui.label(f'🏷️ Associated Tags ({len(tags_list)})').classes('text-xs font-bold uppercase tracking-wider text-zinc-500')
@@ -564,10 +670,10 @@ async def refresh_analytics():
             ui.label("No data to compute charts.").classes('text-sm text-zinc-500')
             return
 
-        avg_score = state.filtered_df['score'].mean()
-        avg_favs = state.filtered_df['fav_count'].mean()
-        avg_w = state.filtered_df['image_width'].mean()
-        avg_h = state.filtered_df['image_height'].mean()
+        avg_score = state.filtered_df['score'].mean() if 'score' in state.filtered_df.columns else 0.0
+        avg_favs = state.filtered_df['fav_count'].mean() if 'fav_count' in state.filtered_df.columns else 0.0
+        avg_w = state.filtered_df['image_width'].mean() if 'image_width' in state.filtered_df.columns else 0.0
+        avg_h = state.filtered_df['image_height'].mean() if 'image_height' in state.filtered_df.columns else 0.0
 
         num_filtered = len(state.filtered_df)
         num_trimmed_filtered = len(set(state.filtered_df['byte_offset']).intersection(state.trimmed_offsets))
@@ -1007,8 +1113,9 @@ def build_ui():
                 with ui.column().classes('w-full gap-2 border-b border-zinc-800 pb-3'):
                     ui.label("🛠️ Multi-Key Filter Builder").classes('text-sm font-bold uppercase tracking-wider text-cyan-400')
 
-                    col_opts = ['id', 'score', 'fav_count', 'rating', 'file_ext', 'image_width', 'image_height', 'tags', 'regular_summary', 'created_at']
-                    col_select = ui.select(col_opts, value='score', label="Filter Column").classes('w-full').props('outlined dark dense color=cyan')
+                    col_opts = list(state.mappings.keys())
+                    default_col_val = "score" if "score" in col_opts else (col_opts[0] if col_opts else "id")
+                    col_select = ui.select(col_opts, value=default_col_val, label="Filter Column").classes('w-full').props('outlined dark dense color=cyan')
 
                     op_opts = ['=', '!=', '>', '<', '>=', '<=', 'contains', 'starts with', 'ends with', 'is empty/null']
 
@@ -1075,7 +1182,9 @@ def build_ui():
                     ui.button('♻️ Unmark ALL Matching', on_click=unmark_all_filtered_for_trim).classes('w-full text-xs font-bold py-1.5').props('color=green')
 
                     ui.label("🔃 Sorting").classes('text-xs font-bold text-zinc-400 mt-1')
-                    ui.select(["score", "fav_count", "image_width", "image_height", "created_at", "id", "byte_offset"], value=state.sort_col, label="Sort By", on_change=on_sort_col_change).classes('w-full').props('outlined dark dense color=cyan')
+                    sort_cols = [k for k in state.mappings.keys() if k != 'individual_parts'] + ['byte_offset']
+                    default_sort_val = "score" if "score" in sort_cols else (sort_cols[0] if sort_cols else "byte_offset")
+                    ui.select(sort_cols, value=state.sort_col or default_sort_val, label="Sort By", on_change=on_sort_col_change).classes('w-full').props('outlined dark dense color=cyan')
                     ui.radio(["Descending", "Ascending"], value=state.sort_order, on_change=on_sort_order_change).classes('w-full text-xs').props('dark inline dense')
 
                     ui.label("🖼️ Gallery Settings").classes('text-sm font-bold uppercase tracking-wider text-cyan-400 mt-2')

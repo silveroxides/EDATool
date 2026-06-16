@@ -1,0 +1,27 @@
+{
+  "mappings": {
+    "id": "id",
+    "score": "score",
+    "rating": "rating",
+    "file_ext": "file_ext",
+    "image_width": "image_width",
+    "image_height": "image_height",
+    "fav_count": "fav_count",
+    "created_at": "created_at",
+    "tags": [
+      "tags",
+      "tag_string"
+    ],
+    "regular_summary": "regular_summary",
+    "individual_parts": "individual_parts"
+  },
+  "image_source": {
+    "type": "url",
+    "keys": [
+      "large_file_url",
+      "file_url",
+      "preview_file_url"
+    ],
+    "prefix": ""
+  }
+}

@@ -64,7 +64,48 @@ def get_or_build_index(jsonl_path, progress_callback=None):
 
     return offsets
 
-def get_or_build_metadata(jsonl_path, offsets, progress_callback=None):
+DEFAULT_MAPPINGS = {
+    "id": "id",
+    "score": "score",
+    "rating": "rating",
+    "file_ext": "file_ext",
+    "image_width": "image_width",
+    "image_height": "image_height",
+    "fav_count": "fav_count",
+    "created_at": "created_at",
+    "tags": ["tags", "tag_string"],
+    "regular_summary": "regular_summary",
+    "individual_parts": "individual_parts"
+}
+
+def resolve_config_key(record, key_mapping):
+    """
+    Safely resolves a configuration mapping value (string, dotted-string, or list of fallbacks)
+    against a given dictionary record.
+    """
+    if not record or not key_mapping:
+        return None
+
+    # Standardize list of fallbacks
+    keys = key_mapping if isinstance(key_mapping, list) else [key_mapping]
+
+    for k in keys:
+        if not isinstance(k, str):
+            continue
+        parts = k.split('.')
+        current = record
+        found = True
+        for part in parts:
+            if isinstance(current, dict) and part in current:
+                current = current[part]
+            else:
+                found = False
+                break
+        if found and current is not None:
+            return current
+    return None
+
+def get_or_build_metadata(jsonl_path, offsets, mappings=None, progress_callback=None):
     """
     Retrieves the queryable metadata DataFrame.
     If the metadata parquet cache file doesn't exist, it builds it.
@@ -73,11 +114,23 @@ def get_or_build_metadata(jsonl_path, offsets, progress_callback=None):
     """
     _, parquet_path = get_cache_paths(jsonl_path)
 
+    if mappings is None:
+        try:
+            if os.path.exists("schema_config.json"):
+                with open("schema_config.json", "r") as f:
+                    config = json.load(f)
+                mappings = config.get("mappings", DEFAULT_MAPPINGS)
+            else:
+                mappings = DEFAULT_MAPPINGS
+        except Exception:
+            mappings = DEFAULT_MAPPINGS
+
+    expected_cols = set(mappings.keys()) | {'byte_offset'}
+
     if os.path.exists(parquet_path):
         try:
             df = pd.read_parquet(parquet_path)
             # Ensure proper columns
-            expected_cols = {'id', 'score', 'rating', 'file_ext', 'image_width', 'image_height', 'fav_count', 'created_at', 'tags', 'regular_summary', 'byte_offset'}
             if expected_cols.issubset(df.columns):
                 return df
         except Exception as e:
@@ -99,47 +152,31 @@ def get_or_build_metadata(jsonl_path, offsets, progress_callback=None):
                 line_str = line_bytes.decode('utf-8', errors='ignore')
                 record = json.loads(line_str)
 
-                # Extract queryable fields with safe defaults
-                score = int(record.get('score', 0) or 0)
-                rating = str(record.get('rating', '') or '').strip()
-                file_ext = str(record.get('file_ext', '') or '').strip().lower()
-                image_width = int(record.get('image_width', 0) or 0)
-                image_height = int(record.get('image_height', 0) or 0)
-                fav_count = int(record.get('fav_count', 0) or 0)
-                created_at = str(record.get('created_at', '') or '')
+                record_data = {}
+                for logical_key, physical_key in mappings.items():
+                    val = resolve_config_key(record, physical_key)
+                    # Safely parse values depending on logical key type
+                    if logical_key in ['id', 'score', 'fav_count', 'image_width', 'image_height']:
+                        if val is None or val == "":
+                            val = 0
+                        else:
+                            try:
+                                val = int(float(val))
+                            except (ValueError, TypeError):
+                                val = 0
+                    elif logical_key == 'file_ext':
+                        val = str(val or '').strip().lower()
+                    elif logical_key in ['rating', 'created_at', 'tags', 'regular_summary', 'individual_parts']:
+                        val = str(val or '').strip()
+                    else:
+                        if isinstance(val, (int, float, bool, str)) or val is None:
+                            pass
+                        else:
+                            val = str(val)
+                    record_data[logical_key] = val
 
-                # Tag search
-                tags = str(record.get('tags', '') or '')
-                if not tags:
-                    tags = str(record.get('tag_string', '') or '')
-                tags = tags.strip()
-
-                # Text search
-                regular_summary = str(record.get('regular_summary', '') or '')
-
-                # ID conversion
-                rec_id = record.get('id')
-                if rec_id is None:
-                    rec_id = 0
-                else:
-                    try:
-                        rec_id = int(rec_id)
-                    except:
-                        rec_id = 0
-
-                metadata_list.append({
-                    'id': rec_id,
-                    'score': score,
-                    'rating': rating,
-                    'file_ext': file_ext,
-                    'image_width': image_width,
-                    'image_height': image_height,
-                    'fav_count': fav_count,
-                    'created_at': created_at,
-                    'tags': tags,
-                    'regular_summary': regular_summary,
-                    'byte_offset': offset
-                })
+                record_data['byte_offset'] = offset
+                metadata_list.append(record_data)
             except Exception:
                 # Malformed JSON lines are skipped gracefully
                 pass
